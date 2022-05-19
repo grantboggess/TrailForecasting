@@ -1,0 +1,488 @@
+# Results
+# 03/26 - Ped - 41.9, Bike - 76.7
+# 03/27 - Ped - 41.9, Bike - 67.5 # Deep learning for bikes
+# 03/29 - Ped - 41.9, Bike - 58.4 # Sunrise, Sunset for bikes
+# 04/04 - Ped - 41.9, Bike - 56.9 # Cos and Sin of Day of Week
+# 04/06 - Ped - 41.9, Bike - 54.3 # Zeroing out negative predictions
+# 04/07 - Ped - X, Bike - 40.9 # Add new data 
+# 04/07 - Ped - X, Bike - 35.7 # Correct weather from utc to Eastern
+# 04/07 - Ped - X, Bike - 32.8 # 0.001 regularization
+# 04/11 - Ped - X, Bike - 33.8 # Resetting keras session after training so model is trained on all data while cross training
+# 04/21 - Ped - X, Bike 30.9 # MAE calculated on average of 5 runs, new data through Apr 18, trimming trail data when no matching weather data
+# 04/22 - Ped - X, Bike - 30.2 # Summing rain over previous 12 hours and future 6 hours. 
+# 04/23 - 31
+# 04/24 - 30
+# 04/25 - 29
+# 04/26 - 28
+# 04/27 - 27
+# 04/28 - 26
+# 04/29 - 25
+# 04/30 - 24
+# 05/01 - 23
+# 05/02 - 22
+# 05/03 - 21
+# Goal: Bike - 20 by May 4
+
+# Ideas: Change mean, median and plot to work for shuffle, (https://www.tensorflow.org/tutorials/keras/keras_tuner) Hyperparameter tuning of num nodes, num layers, regularization, features
+# Play with weighting of previous and future rain
+
+import pandas as pd
+import numpy as np
+import datetime
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.model_selection import train_test_split
+import matplotlib.pyplot as plt
+from sklearn.model_selection import KFold
+import math
+import tensorflow as tf
+from tensorflow import keras
+from keras.models import Sequential
+from keras.layers import Dense
+from astral.sun import sun
+from astral import LocationInfo
+import pytz
+from pytz import timezone
+import os
+import logging
+from scipy.optimize import minimize
+from sklearn.model_selection import train_test_split
+import random
+from tensorflow.keras.models import model_from_json
+from keras import backend as K
+import gc
+import seaborn as sns
+import keras_tuner as kt
+from catboost import CatBoostRegressor
+
+from sklearn.preprocessing import MinMaxScaler
+
+featureList = ['dayCos', 'daySin', 'hourCos', 'hourSin', 'rain', 'temp', 'dst', 'sunset', 'sunrise', 'vis', 'rainPrev', 'rainFuture', 'AvgTemperature', 'WorkingHolidayPercentage', 'GreenvilleSchoolHolidays', 'GreenvilleSchoolHolidayWeekends']
+
+def summedAvgError(y_true, y_pred): 
+    return K.sum(K.abs(y_pred - y_true))/K.sum(y_true)
+
+def optimizeWeights(scaleFactor, direction, features, y): 
+    numIter = 5
+    runError = 0
+    pred = np.array([])
+    actual = np.array([])
+    for i in np.arange(np.size(scaleFactor)): 
+        if direction[0,i] < 0.5: 
+                scaleFactor[0,i] = 1-(scaleFactor[0,i]/21)
+
+    for i in np.arange(len(features.columns)): 
+        features.iloc[:,i] = features.iloc[:,i]*scaleFactor[0,i]
+    for j in np.arange(numIter): 
+        print(f'Starting Iteration {j}')
+
+        kf = KFold(n_splits = 5, shuffle = False)
+        for train_index, test_index in kf.split(features):
+            K.clear_session()
+            tf.keras.backend.clear_session()
+            model = Sequential()
+            model.add(Dense(30, input_dim=len(featureList), activation='relu', kernel_regularizer = keras.regularizers.l2(regularization)))
+            model.add(Dense(60, activation='relu', kernel_regularizer = keras.regularizers.l2(regularization)))
+            model.add(Dense(1))
+            model.compile(loss='mean_absolute_error', optimizer='adam', metrics=['mean_absolute_error'])
+            trainx = features.loc[train_index].reset_index(drop = True)
+            trainy = y.loc[train_index].reset_index(drop = True)
+            testx = features.loc[test_index].reset_index(drop = True)
+            testy = y.loc[test_index].reset_index(drop = True)
+
+            model.fit(trainx, trainy, epochs = 300, verbose = 0)
+            prediction = model.predict(testx)
+            prediction[prediction < 0] = 0
+            actual = np.append(actual, testy.ravel())
+            pred = np.append(pred, prediction.ravel())
+            runError = runError + sum(np.array([abs(testy[x] - prediction[x]) for x in testy.index]))
+            model.reset_states()
+            del model
+            K.clear_session()
+        # if np.size(testy) == np.size(prediction): 
+        #     runError = np.array([abs(testy[x] - prediction[x]) for x in np.arange(np.size(testy))])
+        #     error = np.append(error, runError)
+        mae = sum(abs(pred - actual))/sum(actual)*100
+        print(f'MAE Iteration {j}: {mae}')
+        p = 1
+    
+    return scaleFactor, mae
+
+def createModel(numLayers, units1, units2, units3, regularization): 
+    model = keras.Sequential()
+    if numLayers >= 1: 
+        model.add(Dense(units1, activation = 'relu', input_dim = 18, kernel_regularizer = keras.regularizers.l2(regularization)))
+    if numLayers >= 2: 
+        model.add(Dense(units2, activation = 'relu', kernel_regularizer = keras.regularizers.l2(regularization)))
+    if numLayers >= 3: 
+        model.add(Dense(units3, activation = 'relu', kernel_regularizer = keras.regularizers.l2(regularization)))
+    model.add(Dense(1))
+    model.compile(optimizer = 'adam', loss = summedAvgError, metrics = ['mean_absolute_error', summedAvgError])
+    return model
+
+
+def model_builder(hp): 
+    model = keras.Sequential()
+    numLayers = hp.Int("layers", min_value = 1, max_value = 3, step = 1)
+    units1 = hp.Int("unit1", min_value = 10, max_value = 100, step = 10)
+    units2 = hp.Int("unit2", min_value = 10, max_value = 100, step = 10)
+    units3 = hp.Int("unit3", min_value = 10, max_value = 100, step = 10)
+    regularization = hp.Float("regularization", min_value = 0, max_value = 0.01, step = 0.001)
+    model = createModel(numLayers, units1, units2, units3, regularization)
+    return model
+
+def findClosestWindSpeed(wxData, i):
+    wxDataReduc = wxData[(wxData.DATE <= (wxData.DATE.loc[i] + pd.Timedelta(hours=1))) & (
+                wxData.DATE >= (wxData.DATE.loc[i] - pd.Timedelta(hours=1)))].reset_index(drop=True)
+    wxDataReduc['timeDif'] = abs(wxDataReduc.DATE - wxData.DATE.loc[i])
+    wxDataReduc = wxDataReduc.sort_values(by=['timeDif'], ignore_index=True)
+    for windSpeed in wxDataReduc.WND:
+        windSpeed = float(windSpeed.split(',')[3])
+        if windSpeed < 999:
+            return windSpeed
+            break
+def findClosestWindDirection(wxData, i):
+    wxDataReduc = wxData[(wxData.DATE <= (wxData.DATE.loc[i] + pd.Timedelta(hours=2))) & (
+                wxData.DATE >= (wxData.DATE.loc[i] - pd.Timedelta(hours=2)))].reset_index(drop=True)
+    wxDataReduc['timeDif'] = abs(wxDataReduc.DATE - wxData.DATE.loc[i])
+    wxDataReduc = wxDataReduc.sort_values(by=['timeDif'], ignore_index=True)
+    for windDir in wxDataReduc.WND: 
+        windDir = float(windDir.split(',')[0])
+        if windDir < 999:
+            return windDir
+    return 0
+def findClosestCeiling(wxData, i):
+    wxDataReduc = wxData[(wxData.DATE <= (wxData.DATE.loc[i] + pd.Timedelta(hours=2))) & (
+                wxData.DATE >= (wxData.DATE.loc[i] - pd.Timedelta(hours=2)))].reset_index(drop=True)
+    wxDataReduc['timeDif'] = abs(wxDataReduc.DATE - wxData.DATE.loc[i])
+    wxDataReduc = wxDataReduc.sort_values(by=['timeDif'], ignore_index=True)
+    for ceiling in wxDataReduc.CIG: 
+        ceiling = float(ceiling.split(',')[0]) / 1000
+        if ceiling < 99:
+            return ceiling
+    return 0
+def findClosestCloudCover(wxData, i):
+    wxDataReduc = wxData[(wxData.DATE <= (wxData.DATE.loc[i] + pd.Timedelta(hours=12))) & (
+                wxData.DATE >= (wxData.DATE.loc[i] - pd.Timedelta(hours=12)))].reset_index(drop=True)
+    wxDataReduc['timeDif'] = abs(wxDataReduc.DATE - wxData.DATE.loc[i])
+    wxDataReduc = wxDataReduc.sort_values(by=['timeDif'], ignore_index=True)
+    for cloudCover in wxDataReduc.GF1:
+        if isinstance(cloudCover, str): 
+            try: 
+                cloudCover = float(cloudCover.split(',')[0])
+                if cloudCover < 99:
+                    return cloudCover
+            except: 
+                print(cloudCover)
+            
+    return 0
+
+
+pd.options.mode.chained_assignment = None  # default='warn'
+tf.get_logger().setLevel('INFO')
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
+logging.basicConfig(filename='SRTModel.log', encoding='utf-8', level=logging.INFO)
+logger = logging.getLogger('SRTModel')
+
+
+
+regularization = 0.001
+numIters = 2
+
+logger.info(f'Run Time: {datetime.datetime.now()}')
+logger.info(f'Number of Iterations: {numIters}')
+logger.info(f'Feature List: {featureList}')
+logger.info(f'Regularization: {regularization}')
+logger.info(f'Special Comments: Average Temperature for a day added')
+
+
+
+
+rfPrediction = np.array([])
+Y = np.array([])
+rfPredictionBike = np.array([])
+YBike = np.array([])
+dlBike = np.array([])
+dlPed = np.array([])
+predictionTime = np.array([])
+
+# Import Data
+data = pd.read_csv('2022_0515Hourly.csv', skiprows = 2)
+if 'Unnamed: 7' in data.columns: 
+    data = data.drop(columns = ['Unnamed: 7'])
+data = data.rename(columns = {'Willard Street @ Unity Park Pedestrian': 'pedTotal', 'Willard Street @ Unity Park Cyclist': 'bikeTotal', 'Willard Street @ Unity Park Ped Southbound': 'pedSouth', 'Willard Street @ Unity Park Ped Northbound': 'pedNorth', 'Willard Street @ Unity Park Bike Southbound': 'bikeSouth', 'Willard Street @ Unity Park Bike Northbound': 'bikeNorth'})
+data = data.dropna()
+data.Time = pd.to_datetime(data.Time)  # Convert time column to datetime format
+data = data[data.Time >= datetime.datetime(2022, 2, 1, 11)]
+data.Time = data.Time.dt.tz_localize(tz = 'US/Eastern')
+data.Time = data.Time.dt.tz_convert(tz = 'US/Eastern')
+print('Loaded Data')
+# data.Time = data.Time.dt.tz_localize('UTC').dt.tz_convert('US/Eastern')
+data = data[(data.Time < datetime.datetime(2022, 2, 26, 7, tzinfo = timezone('America/New_York'))) | (data.Time > datetime.datetime(2022, 2, 26, 11, tzinfo = timezone('America/New_York')))]
+data = data.reset_index(drop=True)
+
+#Create features dataframe and add straight up features
+#region
+features = pd.DataFrame()  # Create a copy of data to use for building model
+features['date'] = data.Time.dt.dayofyear
+features['Time'] = data.Time
+features['dow'] = data.Time.dt.dayofweek
+features['hour'] = data.Time.dt.hour
+features['hourCos'] = [math.cos(h / 24 * 2 * math.pi) for h in features.hour]
+features['hourSin'] = [math.sin(h / 24 * 2 * math.pi) for h in features.hour]
+features['dst'] = [1 if t > datetime.datetime(2022, 3, 13, 0, tzinfo = timezone('America/New_York')) else 0 for t in data.Time]
+features['dayCos'] = [math.cos(d / 7 * 2 * math.pi) for d in features.dow]
+features['daySin'] = [math.sin(d / 7 * 2 * math.pi) for d in features.dow]
+#endregion
+
+avgTemp = pd.read_csv('temperatureAverages.csv')
+avgTemp.Time = pd.to_datetime(avgTemp.Time)
+avgTemp.Time = avgTemp.Time.dt.tz_localize(tz = 'US/Eastern')
+avgTemp.Time = avgTemp.Time.dt.tz_convert(tz = 'US/Eastern')
+features = pd.merge_asof(features, avgTemp, on = 'Time')
+
+holidays = pd.read_csv('holidays.csv')
+holidays.Time = pd.to_datetime(holidays.Time)
+holidays.Time = holidays.Time.dt.tz_localize(tz = 'US/Eastern')
+holidays.Time = holidays.Time.dt.tz_convert(tz = 'US/Eastern')
+features = pd.merge_asof(features, holidays, on = 'Time')
+
+# Read in weather data and create empty columns for transforming data
+#region
+wxData = pd.read_csv('2022_0515Weather.csv')
+print('Loaded Weather')
+wxData = wxData[(wxData.REPORT_TYPE == 'FM-15') | (wxData.REPORT_TYPE == 'FM-16')]
+wxData.DATE = pd.to_datetime(wxData.DATE, utc = True)
+wxData.DATE = wxData.DATE.dt.tz_convert('US/Eastern')
+wxData = wxData.reset_index(drop=True)
+wxData['windSpeed'] = np.zeros(len(wxData))
+wxData['windDir'] = np.zeros(len(wxData))
+wxData['temp'] = np.zeros(len(wxData))
+wxData['dewPt'] = np.zeros(len(wxData))
+wxData['ceiling'] = np.zeros(len(wxData))
+wxData['vis'] = np.zeros(len(wxData))
+wxData['cloudCover'] = np.zeros(len(wxData))
+#endregion
+
+for i in np.arange(len(wxData)):
+    wxData.windDir.loc[i] = float(wxData.WND.loc[i].split(',')[0])
+    wxData.windSpeed.loc[i] = float(wxData.WND.loc[i].split(',')[3]) / 10
+    if wxData.windSpeed.loc[i] > 998:
+        wxData.windSpeed.loc[i] = findClosestWindSpeed(wxData, i)
+    if wxData.windDir.loc[i] > 998: 
+        wxData.windDir.loc[i] = findClosestWindDirection(wxData, i)
+    if isinstance(wxData.GF1.loc[i], str):
+        wxData.cloudCover[i] = float(wxData.GF1.loc[i].split(',')[0])
+    else: 
+        wxData.cloudCover[i] = findClosestCloudCover(wxData,i)
+    if wxData.cloudCover[i] > 98: 
+        wxData.cloudCover[i] = findClosestCloudCover(wxData,i)
+    wxData.temp.loc[i] = float(wxData.TMP.loc[i].split(',')[0]) / 10 * 1.8 + 32
+    wxData.dewPt.loc[i] = float(wxData.DEW.loc[i].split(',')[0]) / 10 * 1.8 + 32
+    wxData.ceiling[i] = float(wxData.CIG.loc[i].split(',')[0]) / 1000
+    if wxData.ceiling[i] > 99: 
+        wxData.ceiling[i] = findClosestCeiling(wxData, i)
+    wxData.vis[i] = float(wxData.VIS.loc[i].split(',')[0]) / 1000
+    
+
+wxDataClean = wxData[wxData.DATE.dt.minute == 53].reset_index(drop=True)
+wxDataClean = wxDataClean.dropna(subset=['AA1'])  # The most recent observations (~last 3 hours won't have rain observations entered)
+wxDataClean = wxDataClean.reset_index(drop = True) # This is to handle an error where the second to last row didn't have rain updated. Causes a gap in data. Should be fixed in future
+wxDataClean['rain'] = np.zeros(len(wxDataClean))
+wxDataClean['rainPrev'] = np.zeros(len(wxDataClean))
+wxDataClean['rainFuture'] = np.zeros(len(wxDataClean))
+for i in np.arange(12, len(wxDataClean)):
+    wxDataClean.rain[i] = float(wxDataClean.AA1[i].split(',')[1])
+    if i > 12:
+        rainPrev = 0
+        for j in np.arange(1,13):
+            rainPrev = rainPrev + float(wxDataClean.AA1[i-j].split(',')[1])
+        wxDataClean['rainPrev'][i] = rainPrev
+
+    if i < (len(wxDataClean)-6):
+        rainFuture = 0
+        for j in np.arange(1,7):
+            rainFuture = rainFuture + float(wxDataClean.AA1[(i+j)].split(',')[1])
+        wxDataClean['rainFuture'][i] = rainFuture
+        
+
+wxDataClean = wxDataClean[['DATE', 'windSpeed', 'windDir', 'temp', 'dewPt', 'rain', 'vis', 'ceiling', 'rainPrev', 'rainFuture', 'cloudCover']]
+wxDataClean = wxDataClean.rename(columns={'DATE': 'Time'})
+features = features[features.Time < max(wxDataClean.Time)]
+data = data[data.Time < max(wxDataClean.Time)]
+features = pd.merge_asof(features, wxDataClean, on='Time')
+features['windDirCos'] = [math.cos(windDir/(360)*2*math.pi) for windDir in features.windDir]
+features['windDirSin'] = [math.sin(windDir/(360)*2*math.pi) for windDir in features.windDir]
+features['lowCeiling'] = np.zeros([len(features),1])
+features.lowCeiling[features.ceiling > 4] = 1
+print('Merged Weather Data')
+
+l = LocationInfo('Greenville', 'SC', 'US/Eastern', 34.85, -82.42)
+sunset = [sun(l.observer, t)['sunset'].astimezone(pytz.timezone("US/Eastern")) for t in features.Time]
+features['sunset'] = [t.hour + t.minute / 60 for t in sunset]
+sunrise = [sun(l.observer, t)['sunrise'].astimezone(pytz.timezone("US/Eastern")) for t in features.Time]
+features['sunrise'] = [t.hour + t.minute / 60 for t in sunrise]
+
+
+
+featureTime = features.Time
+features = features[featureList]
+
+features = pd.DataFrame(features, columns=featureList)
+
+
+# model = RandomForestRegressor(n_estimators=100, max_depth=20)
+# modelBike = RandomForestRegressor(n_estimators=100, max_depth=20)
+
+
+runOptimization = False
+if runOptimization: 
+    numIters = 20
+    range = 20
+    results = []
+    scaleFactor, result = optimizeWeights(np.ones([1, len(featureList)]), np.ones([1, len(featureList)]), features.copy(), data.bikeTotal)
+    print(f'Starting Point: {result}')
+    resultsDF = pd.DataFrame(scaleFactor, columns = featureList)
+    resultsDF['result'] = result
+    for i in np.arange(numIters): 
+        randOrBest = np.random.rand(1,1)
+        randOrBest = 0
+        if randOrBest < 0.5: 
+            scaleFactor = np.random.rand(1,len(featureList))
+            scaleFactor = scaleFactor*(range -1)+1
+            direction = np.random.rand(1,len(featureList))
+            direction = np.round(direction) # Scale factors of zero will be inverted. Scale factors of 1 will be kept (i.e. feature multiplied by > 1)
+            direction[0, featureList.index('daySin')] = 1
+            direction[0, featureList.index('hourCos')] = 1
+            direction[0, featureList.index('temp')] = 0
+            direction[0, featureList.index('dst')] = 1
+        else: 
+            prevResults = pd.read_csv('OptimizationTries.csv')
+            bestSF = prevResults[prevResults.result == prevResults.result.min()]
+            bestSF = bestSF.drop(columns = ['result']).reset_index(drop = True)
+            smallAdjustment = np.random.rand(1,len(featureList))
+            smallAdjustment = 1+(smallAdjustment - 0.5)/1e8
+            scaleFactor = np.zeros([1,len(featureList)])
+            for x in np.arange(np.size(scaleFactor, axis = 1)):
+                scaleFactor[0,x] = smallAdjustment[0,x]*bestSF.iloc[0,x]
+            direction = np.ones([1,len(featureList)])
+            print('Trying Small Change from Previous Best')
+        # Repeat 1    
+        multiplier, result = optimizeWeights(scaleFactor.copy(), direction.copy(), features.copy(), data.bikeTotal)
+        print(f'Try {i}: {result} \n')
+        tempDF = pd.DataFrame(multiplier, columns = featureList)
+        tempDF['result'] = result
+        resultsDF = pd.concat([resultsDF, tempDF], ignore_index = True)
+        p = 1
+
+    writePath = 'OptimizationTries.csv'
+    if os.path.exists(writePath):
+        resultsDF.to_csv(writePath, mode = 'a', index = False, header = False) 
+    else: 
+        resultsDF.to_csv(writePath, index = False)
+
+tuneHyperparameters = False
+if tuneHyperparameters: 
+    print('Entering Hyperparameter Tuning')
+    tuner = kt.Hyperband(model_builder, objective = "val_mean_absolute_error", max_epochs = 100, factor = 5, directory = 'Documents/SRTAnalysis/', project_name = 'hptunig', overwrite = True)
+    print('Created Tuner. Starting tuning')
+    tuner.search(features, data.bikeTotal, validation_split = 0.2, shuffle = False)
+    bestHP = tuner.get_best_hyperparameters()[0]
+    tuner.results_summary
+    model = model_builder(bestHP)
+    print('Finished Tuning')
+    print(f"Tuned Parameters: \n Level 1 Units: {bestHP.get('unit1')} \n Level 2 Units: {bestHP.get('unit2')} \n Level 3 Units: {bestHP.get('unit3')} \n Number of Layers: {bestHP.get('layers')} \n Regularization: {bestHP.get('regularization')}")
+    # print(f'Tuned Parameters: \n Level 1 Units: bestHP.get('unit1') \n Level 2 Units: {bestHP.get('unit2')} \n Level 3 Units: {bestHP.get('unit3')} \n Number of Layers: {bestHP.get(layers)} \n Regularization: {bestHP.get(regularization)}')
+
+# featuresStore = features.copy()
+# featureListStore = featureList.copy()
+# for feature in featureListStore[5:len(featuresStore)]:
+#     features = featuresStore.drop(columns = [feature])
+#     featureList = featureListStore.copy()
+#     featureList.remove(feature)
+#     print(f'Removing {feature}')
+testModel = True
+if testModel: 
+    print('Beginning Model Training')
+    # print('Train Test Split to Verify Tuning')
+    # model = model_builder(bestHP)
+    # XTrain, XTest, YTrain, YTest = train_test_split(features, data.bikeTotal, test_size = 0.6, shuffle = False, verbose = 0)
+    # modelFit = model.fit(XTrain, YTrain, epochs = 300, validation_data = (XTest, YTest))
+    # prediction = model.predict(XTest)
+    # # pTrainTest = np.array([])
+    # # yTrainTest = np.array([])
+    # # pTrainTest = np.append(pTrainTest, prediction)
+    # # yTrainTest = np.array(yTrainTest, YTest.ravel())
+    # print(f'MAE of Train Test Split: {sum(abs(prediction[:,0] - YTest))/len(YTest)}')
+    # print(f'Avg Absolute Error of Train Test Split: {sum(abs(prediction[:,0] - YTest))/sum(YTest)}')
+    for i in np.arange(numIters):
+        print(f'Iteration: {i}')
+        kf = KFold(n_splits=5, shuffle = False)
+        
+        for train_index, test_index in kf.split(features):
+            K.clear_session()
+            tf.keras.backend.clear_session()
+            modelDLBike = Sequential()
+            modelDLBike.add(Dense(30, input_dim=len(featureList), activation='relu', kernel_regularizer = keras.regularizers.l2(regularization)))
+            modelDLBike.add(Dense(60, activation='relu', kernel_regularizer = keras.regularizers.l2(regularization)))
+            modelDLBike.add(Dense(20, activation='relu', kernel_regularizer = keras.regularizers.l2(regularization)))
+            modelDLBike.add(Dense(1))
+            modelDLBike.compile(loss ='mean_absolute_error', optimizer='adam', metrics=['mean_absolute_error'])
+            # modelDLBike = CatBoostRegressor(iterations = 500)
+            # modelDLBike = model_builder(bestHP)
+            X_trainPed, Y_trainPed = features.loc[train_index], data.pedTotal.loc[train_index]
+            X_testPed, Y_testPed = features.loc[test_index], data.pedTotal.loc[test_index]
+
+            X_trainBike, Y_trainBike = features.loc[train_index], data.bikeTotal.loc[train_index]
+            X_testBike, Y_testBike = features.loc[test_index], data.bikeTotal.loc[test_index]
+            
+            testTime = featureTime[test_index]
+
+            Y_testPed = Y_testPed.reset_index(drop=True)
+            Y_testBike = Y_testBike.reset_index(drop=True)
+
+            # model.fit(X_trainPed, Y_trainPed)
+            Y = np.append(Y, Y_testPed.ravel())
+            # rfPrediction = np.append(rfPrediction, model.predict(X_testPed))
+
+            # modelBike.fit(X_trainBike, Y_trainBike)
+            YBike = np.append(YBike, Y_testBike.ravel())
+            # rfPredictionBike = np.append(rfPredictionBike, model.predict(X_testBike))
+
+            predictionTime = np.append(predictionTime, testTime)
+            # modelDLBike.fit(X_trainBike, Y_trainBike, verbose = 0)
+            history = modelDLBike.fit(X_trainBike, Y_trainBike, epochs=300, verbose=0, validation_data = (X_testBike, Y_testBike))
+            intervalDLBike = modelDLBike.predict(X_testBike)
+            # plt.figure()
+            # plt.plot(history.history['mean_absolute_error'])
+            # plt.plot(history.history['val_mean_absolute_error'])
+            # plt.legend(['Train Set', 'Test Set'])
+            # plt.pause(1)
+            intervalDLBike[intervalDLBike < 0] = 0
+            dlBike = np.append(dlBike, intervalDLBike)
+            K.clear_session()
+            tf.keras.backend.clear_session()    
+
+        MAEBikeDL = sum(abs(dlBike - YBike)) / sum(YBike) * 100
+        print(f'Bike MAE Deep Learning: {round(MAEBikeDL, 1)}%')
+
+    MAEBikeDL = sum(abs(dlBike - YBike)) / sum(YBike) * 100
+    print(f'Final Bike MAE Deep Learning: {round(MAEBikeDL, 1)}%')
+    logger.info(f'Bike MAE Deep Learning: {round(MAEBikeDL, 1)}%')
+    bikePrediction = pd.DataFrame(dlBike, columns = ['prediction'])
+    bikePrediction['Time'] = predictionTime
+    bikePrediction['target'] = YBike
+    dlBikeShuffleAvg = bikePrediction.groupby('Time', as_index = False)['prediction'].mean()
+    dlBikeShuffleMedian = bikePrediction.groupby('Time', as_index = False)['prediction'].mean()
+    YBikeShuffleAvg = bikePrediction.groupby('Time', as_index = False)['target'].mean()
+    print(f'MAE of Average: {round(sum(abs(dlBikeShuffleAvg.prediction - YBikeShuffleAvg.target))/sum(YBikeShuffleAvg.target)*100,1)}')
+    print(f'MAE of Median: {round(sum(abs(dlBikeShuffleMedian.prediction - YBikeShuffleAvg.target))/sum(YBikeShuffleAvg.target)*100,1)}')
+
+    for i in np.arange(math.floor(len(features) / (14 * 24)) + 1):
+        plt.figure()
+        plt.plot(dlBikeShuffleAvg.Time[(i * 24 * 14):((i + 1) * 14 * 24)], YBikeShuffleAvg.target[(i * 24 * 14):((i + 1) * 14 * 24)])
+        plt.plot(dlBikeShuffleAvg.Time[(i * 24 * 14):((i + 1) * 14 * 24)], dlBikeShuffleAvg.prediction[(i * 24 * 14):((i + 1) * 14 * 24)], '--b',
+                alpha=0.5)
+        plt.xticks(rotation=45)
+        plt.legend(['Actual', 'Projection'])
+        plt.pause(1)
+    plt.show()
